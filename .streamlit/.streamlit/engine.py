@@ -2,6 +2,7 @@
 """Scanner engine for the Streamlit dashboard. Research tool, not investment advice. Never places orders."""
 import argparse, csv, html as _html, io, json, math, os, random, re, threading, time, urllib.parse, urllib.request
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -20,6 +21,7 @@ for _p in ("Banks:HDFCBANK ICICIBANK AXISBANK KOTAKBANK SBIN INDUSINDBK|Finance:
 POS = set("beats surges jumps record upgrade profit growth wins order approval buyback rallies gains soars strong outperform dividend bonus".split())
 NEG = set("falls plunges misses downgrade loss probe fraud raid penalty lawsuit ban resigns weak cuts slump default recall crash warns".split())
 LOCK = threading.Lock(); A = None; INDEX = "^NSEI"; HEALTH = {"ok": 0, "fail": 0}
+CTX = {"mkt": 0.0, "secr": {}, "trend": {}}
 ST = {"open": [], "closed": [], "watch": {"intraday": [], "swing": []}, "status": {}}
 
 def fetch(sym, interval, rng):
@@ -59,8 +61,52 @@ def news(sym):
     return sc, head
 
 _FUND = {}; _FLOCK = threading.Lock()
+def _num(x):
+    try: return float(re.sub(r"[,%\s]", "", x))
+    except Exception: return None
+
+def _strip(x): return _html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", x))).strip()
+
+def _table(page, sid, title):
+    """First data table after the section id (or heading text). Returns (column headers, {row label: [numbers]})."""
+    i = page.find('id="%s"' % sid)
+    if i < 0: i = page.find(title)
+    m = re.search(r"<table.*?</table>", page[i:], re.S) if i >= 0 else None
+    if not m: return [], {}
+    heads, rows = [], {}
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", m.group(0), re.S):
+        cells = [_strip(c) for c in re.findall(r"<t[dh][^>]*>(.*?)</t[dh]>", tr, re.S)]
+        if not cells: continue
+        if "<th" in tr and not heads: heads = cells[1:]
+        else: rows[re.sub(r"\s*\+$", "", cells[0])] = [_num(c) for c in cells[1:]]
+    return heads, rows
+
+def _yoy(v, lag):
+    if v and len(v) > lag and v[-1] is not None and v[-1 - lag] is not None and v[-1 - lag] > 0: return v[-1] / v[-1 - lag] - 1
+    return None
+
+def fund_metrics(qh, q, b):
+    """Quarterly-results + balance-sheet health: summary text, score in [-1, 1] (None if unreadable), results-due-soon flag."""
+    clip = lambda x: max(-1.0, min(1.0, x))
+    sales = q.get("Sales") or q.get("Revenue"); gs = _yoy(sales, 4); gp = _yoy(q.get("Net Profit"), 4)
+    opm = q.get("OPM %"); dm = opm[-1] - opm[-5] if opm and len(opm) > 4 and opm[-1] is not None and opm[-5] is not None else None
+    fin = "Financing Profit" in q or "Interest" in q and not q.get("Sales")
+    bor, res, eq = b.get("Borrowings"), b.get("Reserves"), b.get("Equity Capital")
+    de = bor[-1] / (eq[-1] + res[-1]) if bor and res and eq and None not in (bor[-1], res[-1], eq[-1]) and eq[-1] + res[-1] > 0 else None
+    rg = _yoy(res, 1); comp = []; txt = []
+    if gs is not None: comp.append(clip(gs / 0.2)); txt.append("Sales %+.0f%% YoY" % (gs * 100))
+    if gp is not None: comp.append(clip(gp / 0.3)); txt.append("Net profit %+.0f%% YoY" % (gp * 100))
+    if dm is not None: comp.append(clip(dm / 5)); txt.append("OPM %.0f%% (%+.1fpp YoY)" % (opm[-1], dm))
+    if de is not None and not fin: comp.append(1 if de < 0.3 else 0 if de < 1 else max(-1, -(de - 1) / 0.5)); txt.append("Debt/equity %.2f" % de)
+    if rg is not None: comp.append(clip(rg / 0.15)); txt.append("Reserves %+.0f%% vs prior period" % (rg * 100))
+    soon = False
+    try: soon = (time.time() - datetime.strptime(qh[-1], "%b %Y").timestamp()) > 75 * 86400
+    except Exception: pass
+    return {"fsum": ", ".join(txt), "fscore": round(sum(comp) / len(comp), 2) if comp else None, "results_soon": soon,
+            "qlast": qh[-1] if qh else ""}
+
 def screener(sym):
-    """Public company page on screener.in: key ratios + its pros/cons. Cached 24h, 1 request per 2s. {} on any failure."""
+    """screener.in public company page: key ratios, pros/cons, quarterly results + balance sheet. Cached 24h, 1 request per 2s."""
     base = sym.split(".")[0]
     if base in _FUND and time.time() - _FUND[base][0] < 86400: return _FUND[base][1]
     out = {}
@@ -72,13 +118,14 @@ def screener(sym):
                     page = urllib.request.urlopen(urllib.request.Request("https://www.screener.in/company/%s%s" % (urllib.parse.quote(base), suf), headers=UA), timeout=15).read().decode("utf-8", "ignore")
                 except Exception: page = ""
                 if 'id="top-ratios"' in page: break
-        strip = lambda x: _html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", x))).strip()
         blk = re.search(r'id="top-ratios"(.*?)</ul>', page, re.S)
         if blk:
-            out["ratios"] = {strip(a): strip(b) for a, b in re.findall(r'<span class="name">(.*?)</span>\s*<span class="nowrap value">(.*?)</span>\s*</li>', blk.group(1), re.S)}
+            out["ratios"] = {_strip(a): _strip(b) for a, b in re.findall(r'<span class="name">(.*?)</span>\s*<span class="nowrap value">(.*?)</span>\s*</li>', blk.group(1), re.S)}
         for k in ("pros", "cons"):
             m = re.search(r'<div class="%s">(.*?)</div>' % k, page, re.S)
-            out[k] = [strip(x) for x in re.findall(r"<li[^>]*>(.*?)</li>", m.group(1), re.S)][:5] if m else []
+            out[k] = [_strip(x) for x in re.findall(r"<li[^>]*>(.*?)</li>", m.group(1), re.S)][:5] if m else []
+        qh, q = _table(page, "quarters", "Quarterly Results"); _, b = _table(page, "balance-sheet", "Balance Sheet")
+        if q or b: out.update(fund_metrics(qh, q, b))
     except Exception: out = {}
     _FUND[base] = (time.time() if out else time.time() - 82800, out)
     return out
@@ -141,7 +188,13 @@ def ratios(b, day=None, n=500):
     g = math.exp(sum(math.log(r[2]) for r in out) / len(out))  # remove historical drift: neutral odds
     return [(h/g, l/g, c/g) for h, l, c in out]
 
-def simulate(R, e, target, stop, s, steps, N):
+SCEN = (("Context-tilted base case", 1.0, 1.0, 0.50), ("Neutral: no drift", 0.0, 1.0, 0.20),
+        ("Adverse: tilt reversed, volatility +30%", -1.0, 1.3, 0.15), ("Favourable: tilt doubled, volatility -10%", 2.0, 0.9, 0.15))
+
+def simulate(R, e, target, stop, s, steps, N, d=0.0, vm=1.0):
+    """Monte Carlo from the stock's own past moves. d = extra drift per step, vm = volatility multiplier."""
+    if d or vm != 1.0:
+        R = [(math.exp(math.log(h) * vm + d), math.exp(math.log(l) * vm + d), math.exp(math.log(c) * vm + d)) for h, l, c in R]
     win = st = 0
     for _ in range(N):
         p = e
@@ -153,22 +206,37 @@ def simulate(R, e, target, stop, s, steps, N):
             if th: win += 1; break
     return win / N, st / N
 
+def _clip(x): return max(-1.0, min(1.0, x))
+
 def evaluate(kind, y, s, e, dist, tgt, R, steps, bt, lev, why, expires=None):
     if len(R) < 30 or dist <= 0: return None
-    stop = e - s * dist; target = e * (1 + s * tgt)
-    ps, pst = simulate(R, e, target, stop, s, steps, 6000)
+    stop = e - s * dist; target = e * (1 + s * tgt); N = 2500
+    p0, _ = simulate(R, e, target, stop, s, steps, N)            # quick neutral pass: skip hopeless setups before the slow lookups
+    if p0 < 0.4 * A.min_prob / 100: return None
+    nsc, head = news(y)
+    fund = screener(y) if getattr(A, "screener", False) and y.endswith(".NS") else {}
+    fs = fund.get("fscore"); k = SECT.get(y.split(".")[0], "-")
+    wts = {"news": .25, "fund": .25, "mkt": .20, "sec": .15, "trend": .15} if kind == "swing" else {"news": .30, "fund": .10, "mkt": .25, "sec": .20, "trend": .15}
+    vals = {"news": _clip(nsc / 3), "fund": fs, "mkt": CTX["mkt"], "sec": _clip(CTX["secr"].get(k, 0) / 0.05), "trend": CTX["trend"].get(y, 0)}
+    use = {kk: v for kk, v in vals.items() if v is not None}
+    tilt = sum(wts[kk] * v for kk, v in use.items()) / sum(wts[kk] for kk in use)   # + = bullish for price, - = bearish
+    D = (0.002 if kind == "swing" else 0.00004) * tilt                                 # judgment-based drift per day / per 5-min bar
+    scen = [(nm, *simulate(R, e, target, stop, s, steps, N, D * dm, vm), wt) for nm, dm, vm, wt in SCEN]
+    ps = sum(w * p for _, p, _, w in scen); pst = sum(w * q for _, _, q, w in scen)
     w, n = bt
     p = 0.5 * ps + 0.5 * w / n if n >= 8 else ps
     rr = tgt * e / dist; ev = p * tgt * e - pst * dist
-    nsc, head = news(y)
-    ok = p >= A.min_prob / 100 and rr >= 1.5 and ev > 0 and s * nsc > -2
-    fund = screener(y) if ok and getattr(A, "screener", False) and y.endswith(".NS") else {}
+    veto = s * nsc <= -2 or (kind == "swing" and fs is not None and s * fs < -0.6)
+    ok = p >= A.min_prob / 100 and rr >= 1.5 and ev > 0 and not veto
+    if fund.get("fsum"): why += " | Results/balance sheet: " + fund["fsum"]
+    if fund.get("results_soon"): why += " | WARNING: new quarterly results may land inside this trade window"
     if fund and len(fund.get("cons", [])) >= len(fund.get("pros", [])) + 3 and s == 1: why += " | Screener lists many more cons than pros"
     return {"fund": fund, "id": "%s-%s-%d" % (kind, y, time.time()), "kind": kind, "ysym": y, "sym": y.split(".")[0],
             "side": "BUY" if s == 1 else "SELL", "entry": round(e, 2), "target": round(target, 2), "stop": round(stop, 2),
             "rr": round(rr, 2), "prob": round(p, 3), "sim": round(ps, 3), "bt": round(w / n, 3) if n else None, "bt_n": n,
             "news": nsc, "headline": head, "why": why, "lev": lev, "created": time.time(), "expires": expires,
-            "status": "OPEN", "last": round(e, 2), "pnl": 0.0, "ok": ok}
+            "scen": [[nm, round(pw, 3), wt] for nm, pw, _, wt in scen], "tilt": round(tilt, 2),
+            "ctx": {kk: round(v, 2) for kk, v in use.items()}, "status": "OPEN", "last": round(e, 2), "pnl": 0.0, "ok": ok}
 
 def ingest(kind, recs):
     recs = sorted([r for r in recs if r], key=lambda r: -r["prob"]); now = time.time()
@@ -215,6 +283,9 @@ def scan_swing(data, now, pool):
     for y, r in ret.items(): sec.setdefault(SECT.get(y.split(".")[0], "-"), []).append(r)
     secr = {k: sum(v) / len(v) for k, v in sec.items() if k != "-"}
     ir = ret.get(INDEX, 0.0); tgt = A.target_swing / A.lev_swing / 100
+    ic = comp.get(INDEX)
+    CTX["mkt"] = 0.0 if not ic else (1.0 if ic[-1][4] > sma([x[4] for x in ic], 50) else -1.0)
+    CTX["secr"] = secr; CTX["trend"] = {y: _clip((c[-1][4] / c[-127][4] - 1) / 0.3) for y, c in comp.items() if len(c) > 127}
     jobs = [(y, s, g) for y, c in comp.items() if y != INDEX for s in (1, -1)
             for g in [swing_signal(c, s)] if g and abs(live[y] / g["p"] - 1) < 0.015]
     def job(j):
@@ -228,8 +299,7 @@ def scan_swing(data, now, pool):
               "high" if s == 1 else "low", k, ("%+.1f%% (20d)" % (secr[k] * 100)) if k in secr else "n/a", (ret[y] - ir) * 100)
         return evaluate("swing", y, s, live[y], g["dist"], tgt, ratios(c), 3, (w, n), A.lev_swing, why)
     ingest("swing", list(pool.map(job, jobs)))
-    ic = comp.get(INDEX)
-    return len(comp), ("Bullish (index above 50DMA)" if ic and ic[-1][4] > sma([x[4] for x in ic], 50) else "Bearish (index below 50DMA)")
+    return len(comp), ("Bullish (index above 50DMA)" if CTX["mkt"] > 0 else "Bearish (index below 50DMA)")
 
 def update_open(now, pool):
     with LOCK: cur = list(ST["open"])
