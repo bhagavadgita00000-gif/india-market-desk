@@ -27,7 +27,9 @@ with st.sidebar:
 - Swing target: **{A.target_swing}%** price move, 3 sessions
 - Minimum probability: **{A.min_prob:g}%**
 
-Probability = 50% simulation (6,000 paths from the stock's own past moves) + 50% how often this exact setup worked in its past.""")
+Probability = 50% scenario simulation + 50% how often this exact setup worked in the stock's own past (when it has at least 8 past cases).
+
+The simulation replays the stock's own past price moves (10,000 paths) under 4 scenarios, tilted by news, quarterly results and balance sheet, market trend, sector and the stock's own 6-month trend.""")
     st.caption("Research tool, not investment advice. Estimates can be wrong. It never places orders.")
 
 st.title("📈 Indian Market Live Desk")
@@ -41,7 +43,8 @@ def table(rows, closed=False):
         "History %": None if x["bt"] is None else round(x["bt"] * 100), "Past setups": x["bt_n"],
         "Result" if closed else "Live": x["status"] if closed else x["last"], "P/L % on capital": x["pnl"],
         "Opened": time.strftime("%d %b %H:%M", time.localtime(x["created"])),
-        "Fundamentals (Screener)": " · ".join("%s %s" % (k, v) for k, v in list((x.get("fund") or {}).get("ratios", {}).items())[:4] if k in ("Stock P/E", "ROE", "ROCE", "Market Cap")) or "–",
+        "Results & balance sheet": (x.get("fund") or {}).get("fsum") or "–",
+        "Context tilt": x.get("tilt"),
         "Why": x["why"] + (" | News: " + x["headline"] if x.get("headline") else "")} for x in rows])
     st.dataframe(d, hide_index=True, width="stretch", column_config={
         "Probability %": st.column_config.ProgressColumn("Probability %", min_value=0, max_value=100, format="%d%%"),
@@ -86,6 +89,12 @@ def live():
             with st.expander(f"{x['sym']} · {x['side']} · {x['kind']} · {round(x['prob']*100)}% probability"):
                 st.write("**Latest headline:** " + (x.get("headline") or "none in the last 3 days") + f"  (sentiment score {x['news']:+d})")
                 st.write("**Past-trend context:** " + x["why"])
+                if x.get("scen"):
+                    st.write("**Simulation under different conditions** (context tilt %+.2f; + = bullish for price)" % x.get("tilt", 0))
+                    st.dataframe(pd.DataFrame([{"Scenario": n, "Chance of hitting target %": round(p * 100, 1), "Weight %": round(w * 100)} for n, p, w in x["scen"]]), hide_index=True, width="stretch")
+                    st.caption("Inputs (-1 bearish to +1 bullish): " + ", ".join("%s %+.2f" % (k, v) for k, v in x.get("ctx", {}).items()))
+                if f.get("fsum"): st.write("**Latest quarterly results & balance sheet (Screener, quarter %s):** %s" % (f.get("qlast", "?"), f["fsum"]))
+                if f.get("results_soon"): st.warning("A new quarterly result may be announced during this trade. Results days can gap the price either way.")
                 if f.get("ratios"): st.write("**Key ratios (Screener):** " + " · ".join(f"{k}: {v}" for k, v in f["ratios"].items()))
                 c1, c2 = st.columns(2)
                 c1.write("**Pros (Screener)**"); [c1.write("• " + p) for p in f.get("pros", [])] or c1.write("–")
