@@ -1,0 +1,13 @@
+{
+  "capital": 30000,
+  "lev_intraday": 5,
+  "target_intraday": 6,
+  "stretch_intraday": 10,
+  "lev_swing": 1,
+  "target_swing": 6,
+  "stretch_swing": 10,
+  "min_prob": 25,
+  "max_open": 8,
+  "invalidate_prob": 5,
+  "screener": true
+}
