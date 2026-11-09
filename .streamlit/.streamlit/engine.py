@@ -21,7 +21,7 @@ for _p in ("Banks:HDFCBANK ICICIBANK AXISBANK KOTAKBANK SBIN INDUSINDBK|Finance:
 POS = set("beats surges jumps record upgrade profit growth wins order approval buyback rallies gains soars strong outperform dividend bonus".split())
 NEG = set("falls plunges misses downgrade loss probe fraud raid penalty lawsuit ban resigns weak cuts slump default recall crash warns".split())
 LOCK = threading.Lock(); A = None; INDEX = "^NSEI"; HEALTH = {"ok": 0, "fail": 0}
-CTX = {"mkt": 0.0, "secr": {}, "trend": {}}
+CTX = {"mkt": 0.0, "secr": {}, "trend": {}}; DAILY = {}
 ST = {"open": [], "closed": [], "watch": {"intraday": [], "swing": []}, "status": {}}
 
 def fetch(sym, interval, rng):
@@ -210,6 +210,8 @@ def _clip(x): return max(-1.0, min(1.0, x))
 
 def evaluate(kind, y, s, e, dist, tgt, R, steps, bt, lev, why, expires=None):
     if len(R) < 30 or dist <= 0: return None
+    qty = int(A.capital * lev / e)                                   # shares you can buy with your capital x leverage
+    if qty < 1: return None
     stop = e - s * dist; target = e * (1 + s * tgt); N = 2500
     p0, _ = simulate(R, e, target, stop, s, steps, N)            # quick neutral pass: skip hopeless setups before the slow lookups
     if p0 < 0.4 * A.min_prob / 100: return None
@@ -226,6 +228,8 @@ def evaluate(kind, y, s, e, dist, tgt, R, steps, bt, lev, why, expires=None):
     w, n = bt
     p = 0.5 * ps + 0.5 * w / n if n >= 8 else ps
     rr = tgt * e / dist; ev = p * tgt * e - pst * dist
+    tgt2 = (A.stretch_intraday / A.lev_intraday if kind == "intraday" else A.stretch_swing / A.lev_swing) / 100
+    target2 = e * (1 + s * tgt2); p2, _ = simulate(R, e, target2, stop, s, steps, 1500, D, 1.0)   # chance of the bigger (stretch) target
     veto = s * nsc <= -2 or (kind == "swing" and fs is not None and s * fs < -0.6)
     ok = p >= A.min_prob / 100 and rr >= 1.5 and ev > 0 and not veto
     if fund.get("fsum"): why += " | Results/balance sheet: " + fund["fsum"]
@@ -233,21 +237,30 @@ def evaluate(kind, y, s, e, dist, tgt, R, steps, bt, lev, why, expires=None):
     if fund and len(fund.get("cons", [])) >= len(fund.get("pros", [])) + 3 and s == 1: why += " | Screener lists many more cons than pros"
     return {"fund": fund, "id": "%s-%s-%d" % (kind, y, time.time()), "kind": kind, "ysym": y, "sym": y.split(".")[0],
             "side": "BUY" if s == 1 else "SELL", "entry": round(e, 2), "target": round(target, 2), "stop": round(stop, 2),
+            "target2": round(target2, 2), "p2": round(p2, 3), "qty": qty, "cap_profit": round(qty * abs(target - e)),
+            "cap_profit2": round(qty * abs(target2 - e)), "cap_loss": round(qty * dist),
             "rr": round(rr, 2), "prob": round(p, 3), "sim": round(ps, 3), "bt": round(w / n, 3) if n else None, "bt_n": n,
             "news": nsc, "headline": head, "why": why, "lev": lev, "created": time.time(), "expires": expires,
             "scen": [[nm, round(pw, 3), wt] for nm, pw, _, wt in scen], "tilt": round(tilt, 2),
-            "ctx": {kk: round(v, 2) for kk, v in use.items()}, "status": "OPEN", "last": round(e, 2), "pnl": 0.0, "ok": ok}
+            "ctx": {kk: round(v, 2) for kk, v in use.items()}, "status": "OPEN", "last": round(e, 2), "pnl": 0.0, "pnl_rs": 0, "ok": ok}
 
 def ingest(kind, recs):
-    recs = sorted([r for r in recs if r], key=lambda r: -r["prob"]); now = time.time()
+    recs = sorted([r for r in recs if r], key=lambda r: -r["prob"]); now = time.time(); new = []
     with LOCK:
         busy = {x["ysym"] for x in ST["open"]}
         cool = {x["ysym"] for x in ST["closed"] if x["kind"] == kind and now - x["closed"] < (86400 if kind == "intraday" else 3 * 86400)}
         room = A.max_open - sum(1 for x in ST["open"] if x["kind"] == kind)
         for r in recs:
             if r["ysym"] in busy or r["ysym"] in cool or not r["ok"] or room <= 0: continue
-            ST["open"].append(r); busy.add(r["ysym"]); room -= 1
+            ST["open"].append(r); busy.add(r["ysym"]); room -= 1; new.append(r)
         ST["watch"][kind] = [r for r in recs if r["ysym"] not in busy][:8]
+    for r in new:                                                    # phone alert for every new signal
+        buy = r["side"] == "BUY"
+        notify("%s %s (%s)" % (r["side"], r["sym"], r["kind"]),
+               "Entry %.2f | Target %.2f (+₹%s) | Stop-loss %.2f (-₹%s) | Qty %d | Chance %d%% | Stretch %.2f (+₹%s)%s" % (
+                   r["entry"], r["target"], _inr(r["cap_profit"]), r["stop"], _inr(r["cap_loss"]), r["qty"], round(r["prob"] * 100),
+                   r["target2"], _inr(r["cap_profit2"]), "" if buy else " | SELL = intraday short only"), 4, "chart_with_upwards_trend" if buy else "chart_with_downwards_trend")
+        r["notified"] = True
 
 def intra_job(y, tgt, lev, now):
     bars, end, off = fetch(y, "5m", "60d")
@@ -301,6 +314,19 @@ def scan_swing(data, now, pool):
     ingest("swing", list(pool.map(job, jobs)))
     return len(comp), ("Bullish (index above 50DMA)" if CTX["mkt"] > 0 else "Bearish (index below 50DMA)")
 
+def _close(sig, status, px, ts, reason, s):
+    sig.update(status=status, exit=round(px, 2), closed=ts, reason=reason, month=time.strftime("%Y-%m", time.gmtime(ts + A.tz)))
+    sig["pnl"] = round(s * (px / sig["entry"] - 1) * 100 * sig["lev"], 2)
+    sig["pnl_rs"] = round(sig.get("qty", 0) * s * (px - sig["entry"]))
+    with LOCK:
+        ST["open"] = [x for x in ST["open"] if x["id"] != sig["id"]]
+        ST["closed"] = ([slim(sig)] + ST["closed"])[:3000]
+    hit = status in ("TARGET HIT", "STOP HIT")
+    notify("%s: %s %s₹%s" % (status, sig["sym"], "+" if sig["pnl_rs"] >= 0 else "-", _inr(abs(sig["pnl_rs"]))),
+           "%s %s closed at %.2f (entry %.2f). %s%s" % (sig["side"], sig["sym"], px, sig["entry"], reason,
+                                                       " Exit now if you are still holding." if status != "TARGET HIT" else ""),
+           4 if hit else 3, "white_check_mark" if status == "TARGET HIT" else "x")
+
 def update_open(now, pool):
     with LOCK: cur = list(ST["open"])
     if not cur: return
@@ -311,20 +337,29 @@ def update_open(now, pool):
         for x in after:
             sh = x[3] <= sig["stop"] if s == 1 else x[2] >= sig["stop"]
             th = x[2] >= sig["target"] if s == 1 else x[3] <= sig["target"]
-            if sh: out = ("STOP HIT", sig["stop"], x[0]); break
-            if th: out = ("TARGET HIT", sig["target"], x[0]); break
+            if sh: out = ("STOP HIT", sig["stop"], x[0], "Stop-loss price was touched."); break
+            if th: out = ("TARGET HIT", sig["target"], x[0], "Target price was reached."); break
         last = bars[-1][4]
+        cd = (sig["created"] + off) // 86400; da = {(x[0] + off) // 86400 for x in after if (x[0] + off) // 86400 > cd}
         if not out:
-            if sig["kind"] == "intraday" and sig["expires"] and now > sig["expires"]: out = ("EXPIRED (EOD)", last, now)
-            elif sig["kind"] == "swing":
-                cd = (sig["created"] + off) // 86400; da = {(x[0] + off) // 86400 for x in after if (x[0] + off) // 86400 > cd}
-                if len(da) >= 3 and (len(da) > 3 or now - bars[-1][0] > 1800): out = ("EXPIRED (3 days)", last, now)
-        px = out[1] if out else last
-        sig["last"] = round(last, 2); sig["pnl"] = round(s * (px / sig["entry"] - 1) * 100 * sig["lev"], 2)
-        if out:
-            sig.update(status=out[0], exit=round(out[1], 2), closed=out[2])
-            with LOCK:
-                ST["open"] = [x for x in ST["open"] if x["id"] != sig["id"]]; ST["closed"] = ([sig] + ST["closed"])[:300]
+            if sig["kind"] == "intraday" and sig.get("expires") and now > sig["expires"]:
+                out = ("EXPIRED (EOD)", last, now, "Market closed before the target or stop-loss was hit.")
+            elif sig["kind"] == "swing" and len(da) >= 3 and (len(da) > 3 or now - bars[-1][0] > 1800):
+                out = ("EXPIRED (3 days)", last, now, "The 3-session window ended before the target or stop-loss was hit.")
+        if not out and A.invalidate_prob > 0:                          # close early if the target has become unrealistic
+            R, left = None, 0
+            if sig["kind"] == "intraday" and sig.get("expires") and now - sig["created"] > 1800:
+                left = int((sig["expires"] - bars[-1][0]) // 300); R = ratios(bars, lambda x: (x[0] + off) // 86400)
+            elif sig["kind"] == "swing" and sig["ysym"] in DAILY and DAILY[sig["ysym"]][0] and len(da) >= 1:
+                left = 3 - len(da); R = ratios(DAILY[sig["ysym"]][0])
+            if R and len(R) >= 30 and left >= 1:
+                p, _ = simulate(R, last, sig["target"], sig["stop"], s, left, 1500)
+                if p < A.invalidate_prob / 100:
+                    out = ("INVALIDATED", last, now, "Target now unlikely: only about %.0f%% chance left in the remaining time." % (p * 100))
+        sig["last"] = round(last, 2)
+        if out: _close(sig, out[0], out[1], out[2], out[3], s)
+        else:
+            sig["pnl"] = round(s * (last / sig["entry"] - 1) * 100 * sig["lev"], 2); sig["pnl_rs"] = round(sig.get("qty", 0) * s * (last - sig["entry"]))
 
 def universe():
     if A.universe:
@@ -339,36 +374,83 @@ def universe():
     except Exception:
         print("Nifty 500 list unavailable, using Nifty 50"); return [s + ".NS" for s in NIFTY50]
 
+KEEP = ("id", "kind", "ysym", "sym", "side", "entry", "target", "target2", "stop", "exit", "status", "reason", "pnl", "pnl_rs",
+        "qty", "lev", "prob", "created", "closed", "month")
+def slim(sig): return {k: sig[k] for k in KEEP if k in sig}
+
+DEFAULTS = dict(market="nse", universe=None, limit=500, interval=300, workers=32, capital=30000.0, target_swing=6.0, stretch_swing=10.0,
+                target_intraday=6.0, stretch_intraday=10.0, lev_swing=1.0, lev_intraday=5.0, min_prob=25.0, max_open=8, topk=120,
+                min_turnover=2e7, invalidate_prob=5.0, tz=19800, once=False, screener=True)
+
+def _inr(x): return "{:,.0f}".format(x)
+
+def notify(title, msg, prio=3, tag="bell"):
+    """Phone push via ntfy.sh. Needs the NTFY_TOPIC environment variable; silently does nothing without it."""
+    topic = os.environ.get("NTFY_TOPIC")
+    if not topic: return
+    try:
+        body = json.dumps({"topic": topic, "title": title, "message": msg, "priority": prio, "tags": [tag]}).encode()
+        urllib.request.urlopen(urllib.request.Request("https://ntfy.sh/", data=body, headers={"Content-Type": "application/json"}), timeout=10)
+    except Exception as ex: print("notify failed:", repr(ex))
+
+def read_config():
+    """config.json: from GitHub (live edits, when running in GitHub Actions) or the local copy."""
+    d = {}
+    try: d = json.load(open("config.json"))
+    except Exception: pass
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    if repo:
+        try: d = json.load(urllib.request.urlopen(urllib.request.Request("https://raw.githubusercontent.com/%s/main/config.json" % repo, headers=UA), timeout=15))
+        except Exception: pass
+    return d
+
+def apply_config(d):
+    for k, v in d.items():
+        if k in DEFAULTS and k not in ("market", "universe") and v is not None:
+            try: setattr(A, k, type(DEFAULTS[k])(v))
+            except Exception: pass
+
 _gist_t = [0.0]
 def _gist(method, body=None):
-    tok, gid = os.environ.get("GITHUB_TOKEN"), os.environ.get("GIST_ID")
+    tok = os.environ.get("GIST_TOKEN") or os.environ.get("GITHUB_TOKEN"); gid = os.environ.get("GIST_ID")
     if not (tok and gid): return None
     req = urllib.request.Request("https://api.github.com/gists/" + gid, data=json.dumps(body).encode() if body else None, method=method,
         headers={"Authorization": "Bearer " + tok, "Accept": "application/vnd.github+json", "User-Agent": "desk"})
     return json.load(urllib.request.urlopen(req, timeout=20))
 
+def remote_state():
+    """The scanner's saved state from the secret gist (used by the dashboard and when a scan job starts)."""
+    g = _gist("GET")
+    if not g: return None
+    f = g["files"]["state.json"]; c = f.get("content", "")
+    if f.get("truncated"): c = urllib.request.urlopen(urllib.request.Request(f["raw_url"], headers={"User-Agent": "desk"}), timeout=30).read().decode()
+    return json.loads(c)
+
 def load_state():
     try:
-        g = _gist("GET")
-        if g: ST.update(json.loads(g["files"]["state.json"]["content"])); return
+        d = remote_state()
+        if d: ST.update(d); return
     except Exception as ex: print("gist load failed:", repr(ex))
     if os.path.exists("state.json"):
         try: ST.update(json.load(open("state.json")))
         except Exception: pass
 
-def save():
-    with LOCK: txt = json.dumps(ST)
+def save(force=False):
+    with LOCK:
+        ST["closed"] = [c for c in ST["closed"] if time.time() - c.get("closed", 0) < 400 * 86400][:3000]
+        txt = json.dumps(ST)
     open("state.json.tmp", "w").write(txt); os.replace("state.json.tmp", "state.json")
-    if time.time() - _gist_t[0] > 120:
+    if force or time.time() - _gist_t[0] > 120:
         try:
             if _gist("PATCH", {"files": {"state.json": {"content": txt}}}): _gist_t[0] = time.time()
         except Exception as ex: print("gist save failed:", repr(ex))
 
-def loop(syms):
+def loop(syms, until=None):
     pool = ThreadPoolExecutor(A.workers); daily = {}; last_daily = 0
     while True:
         t0 = time.time(); now = t0
         try:
+            apply_config(read_config())
             ib, ie, _ = fetch(INDEX, "5m", "5d")
             mkt = bool(ib) and now - ib[-1][0] < 900 and (not ie or now < ie)
             update_open(now, pool)
@@ -380,7 +462,7 @@ def loop(syms):
             regime, n = ST["status"].get("regime", "-"), ST["status"].get("scanned", 0)
             if now - last_daily > 1200:
                 res = list(pool.map(lambda y: fetch(y, "1d", "2y"), syms + [INDEX]))
-                daily = dict(zip(syms + [INDEX], res)); last_daily = now
+                daily = dict(zip(syms + [INDEX], res)); last_daily = now; DAILY.clear(); DAILY.update(daily)
                 n, regime = scan_swing(daily, now, pool)
                 mv = [{"sym": y.split(".")[0], "price": round(b[-1][4], 2), "chg": round((b[-1][4] / b[-2][4] - 1) * 100, 2)}
                       for y, (b, _, _) in daily.items() if b and len(b) > 2 and y != INDEX]
@@ -397,25 +479,25 @@ def loop(syms):
                 ingest("intraday", [r for rs in pool.map(lambda y: intra_job(y, tgt, A.lev_intraday, time.time()), top) for r in rs])
             with LOCK:
                 ST["status"] = {"last_scan": time.time(), "universe": len(syms), "scanned": n, "market_open": mkt, "regime": regime,
-                    "index": INDEX, "fetch_ok": HEALTH["ok"], "fetch_fail": HEALTH["fail"], "cfg": {"swing_target_pct": A.target_swing, "swing_lev": A.lev_swing, "intraday_target_pct": A.target_intraday,
-                    "intraday_lev": A.lev_intraday, "min_prob": A.min_prob}}
+                    "index": INDEX, "fetch_ok": HEALTH["ok"], "fetch_fail": HEALTH["fail"],
+                    "cfg": {k: getattr(A, k) for k in ("capital", "target_intraday", "stretch_intraday", "lev_intraday", "target_swing", "stretch_swing", "lev_swing", "min_prob")}}
             save()
         except Exception as ex: print("cycle error:", repr(ex))
         print("scan done in %.0fs | open %d | closed %d" % (time.time() - t0, len(ST["open"]), len(ST["closed"])))
-        if A.once: return
-        time.sleep(max(5, A.interval - (time.time() - t0)))
+        if A.once or (until is not None and time.time() >= until): break
+        nap = max(5, A.interval - (time.time() - t0))
+        if until is not None: nap = min(nap, max(1, until - time.time()))
+        time.sleep(nap)
+    save(True)
 
-
-_started = False
-def start(cfg=None):
-    """Start the background scanner once per process; cfg overrides defaults."""
-    global A, INDEX, _started
-    if _started: return A
-    d = dict(market="nse", universe=None, limit=500, interval=300, workers=32, target_swing=6.0, target_intraday=6.0,
-             lev_swing=1.0, lev_intraday=5.0, min_prob=25.0, max_open=8, topk=120, min_turnover=2e7, once=False, screener=True)
-    d.update(cfg or {}); A = argparse.Namespace(**d)
+def init(cfg=None):
+    global A, INDEX
+    A = argparse.Namespace(**DEFAULTS); cfg = cfg or {}
+    A.market = cfg.get("market", "nse"); A.universe = cfg.get("universe"); apply_config(cfg)
+    if A.market == "us": INDEX = "^GSPC"; A.min_turnover = 5e6; A.tz = -14400
     load_state()
-    if A.market == "us": INDEX = "^GSPC"; A.min_turnover = 5e6
-    syms = universe()
-    threading.Thread(target=loop, args=(syms,), daemon=True).start(); _started = True
     return A
+
+def run(until=None):
+    """Run the scanner loop in this process until `until` (epoch seconds), or for a single cycle if until is now/past."""
+    init(read_config()); loop(universe(), until)
