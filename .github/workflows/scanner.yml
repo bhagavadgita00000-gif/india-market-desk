@@ -1,0 +1,33 @@
+name: scanner
+on:
+  schedule:
+    - cron: "40 3 * * 1-5"    # 09:10 IST  - morning shift (runs up to ~5h50m)
+    - cron: "25 9 * * 1-5"    # 14:55 IST  - afternoon shift (starts when the morning one ends)
+    - cron: "20 10 * * 1-5"   # 15:50 IST  - one scan after the close for swing setups
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Only send a test notification to my phone"
+        type: boolean
+        default: false
+concurrency:
+  group: scanner
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run scanner
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          if [ "${{ inputs.test }}" = "true" ]; then python runner.py --test; else python runner.py; fi
